@@ -1,2 +1,1 @@
-# object-weight-estimation
-RGB 카메라 사물 인식 및 무게 추정 시스템
+python main.py --image_path sample.jpg --save_image --output_path 1.png 
