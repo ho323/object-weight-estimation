@@ -19,7 +19,7 @@ def load_depth_model(device):
     de_model.eval()
     return de_model
 
-def estimate_depth(raw_img, model, device):
+def estimate_depth(raw_img, model):
     with torch.no_grad():
         return model.infer_image(raw_img)
 
@@ -85,25 +85,46 @@ def material_classification_and_weight(cropped_images, boxes, class_ids, depth_m
         # 3D 좌표 및 가로, 세로, 깊이 정보 얻기
         points, x, y, z = depth_to_pointcloud(depth_map, box)
 
-        # 가로, 세로 계산 (BBox 영역에서의 x와 y의 차이를 계산)
-        width = np.max(x) - np.min(x)  # x의 최대/최소 차이로 가로
-        height = np.max(y) - np.min(y)  # y의 최대/최소 차이로 세로
-        depth = np.mean(z)  # 평균 깊이
+        # # 실제 측정한 가로, 세로, 깊이
+        # width = np.max(x) - np.min(x)
+        # height = np.max(y) - np.min(y)
+        # depth = np.mean(z)
 
         # 부피 계산
         volume = calc_volume(points)
 
-        image_pil = Image.fromarray(crop_img)
-        material, _ = materials_classification(mtr_model, mtr_classes, image_pil)
+        # 클래스 이름 가져오기
+        class_name = result.names[cls_id]
+
+        # 평균 크기 및 무게 가져오기
+        if class_name in cfg.COCO_CLASS_INFO:
+            avg_info = cfg.COCO_CLASS_INFO[class_name]
+
+            avg_width = avg_info['width']
+            avg_height = avg_info['height']
+            avg_depth = avg_info['depth']
+            avg_weight = avg_info['weight']
+
+            # 부피 비율로 보정 (3축 모두)
+            average_volume = avg_width * avg_height * avg_depth
+
+            if average_volume > 0:
+                volume_ratio = volume / average_volume
+                weight = avg_weight * volume_ratio
+            else:
+                weight = avg_weight  # 혹시 평균 부피가 0이면 그냥 평균 무게 사용
+        else:
+            # 클래스 정보가 없으면 조정 없이 0
+            weight = 0
 
         depth_infos.append({
             "id": i,
-            "class": result.names[cls_id],
+            "class": class_name,
             "volume": volume,
-            "material": material,
-            "width": width,  
-            "height": height,  
-            "depth": depth,
+            # "width": width,
+            # "height": height,
+            # "depth": depth,
+            "weight": weight,
         })
 
     return depth_infos
@@ -123,6 +144,7 @@ def process_image(image_path, output_path, save_image=False):
 
     print("Depth Estimation running...")
     de_model = load_depth_model(device)
+    depth_map = estimate_depth(rgb_img, de_model)
     
     print("YOLOv8 running...")
     results = load_yolo_model_and_run(rgb_img, cfg.OD_MODEL_PATH, conf_threshold=0.6)
@@ -130,26 +152,26 @@ def process_image(image_path, output_path, save_image=False):
     cropped_images, boxes, class_ids, class_names = extract_bounding_boxes_and_crops(results)
 
     mtr_model, mtr_classes = init_model()
-    depth_infos = material_classification_and_weight(cropped_images, boxes, class_ids, de_model.infer_image(rgb_img), mtr_model, mtr_classes, results[0])
+    depth_infos = material_classification_and_weight(cropped_images, boxes, class_ids, depth_map, mtr_model, mtr_classes, results[0])
 
     # BBox 옆에 라벨 추가
-    for i, (box, cls_id) in enumerate(zip(boxes, class_ids)):
+    for i, (box, cls_id, class_name) in enumerate(zip(boxes, class_ids, class_names)):
         x1, y1, x2, y2 = box
-        material = depth_infos[i]['material']
         volume = depth_infos[i]['volume']
-        weight = cfg.DENSITIES[material] * volume
-        width = depth_infos[i]['width']
-        height = depth_infos[i]['height']
-        depth = depth_infos[i]['depth']
+        weight = depth_infos[i]['weight']
+        # width = depth_infos[i]['width']
+        # height = depth_infos[i]['height']
+        # depth = depth_infos[i]['depth']
         
-        label = f"{results[0].names[cls_id]} {material} Vol: {volume:.2f}cm³ W: {weight/1000:.2f}kg"
-        dimension_info = f"WxH: {width:.2f}x{height:.2f}cm D: {depth:.2f}cm"
+        label = f"{class_name}, Vol: {volume:.1f}cm^3, Weight: {weight:.1f}kg"
+        # dimension_info = f"W: {width:.1f}, H: {height:.1f}cm, D: {depth:.1f}cm"
+        print(label)
         
         # BBox 그리기
         cv2.rectangle(rgb_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
         # 라벨 추가
-        cv2.putText(rgb_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-        cv2.putText(rgb_img, dimension_info, (x1, y2 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.putText(rgb_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 2)
+        # cv2.putText(rgb_img, dimension_info, (x1, y2 + 15), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
 
     if save_image:
         # RGB 이미지를 저장 (BGR로 변환하여 저장)
@@ -177,7 +199,7 @@ def process_video(video_source=0):
         raw_img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         print("Depth Estimation running...")
-        depth_map = estimate_depth(raw_img, de_model, device)
+        depth_map = estimate_depth(raw_img, de_model)
 
         print("YOLOv8 running...")
         results = load_yolo_model_and_run(frame, cfg.OD_MODEL_PATH, conf_threshold=0.6)
