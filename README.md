@@ -1,1 +1,1 @@
-python main.py --image_path sample.jpg --save_image --output_path 1.png 
+python main.py --save_image --output_path glove.png --image_path glove/glove01.jpeg
