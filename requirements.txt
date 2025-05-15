@@ -1,0 +1,8 @@
+numpy
+opencv-python
+open3d
+torch
+torchvision
+ultralytics
+segment-anything
+
