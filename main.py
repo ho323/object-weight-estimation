@@ -4,23 +4,41 @@ import cv2
 import numpy as np
 import open3d as o3d
 import torch
-from PIL import Image
-from model.yolo import load_yolo_model, run_yolo_inference
-from depth_anything_v2.dpt import DepthAnythingV2
+import numpy as np
+import depth_pro
+from ultralytics import YOLO
+from segment_anything import sam_model_registry, SamPredictor
 from time import time
 
 
-# Depth Estimation을 위한 함수
-def load_depth_model(device):
-    de_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384])
-    de_model.load_state_dict(torch.load(cfg.DE_MODEL_PATH, map_location=device))
-    de_model.to(device)
-    de_model.eval()
-    return de_model
+def load_depth_estimation_model():
+    model, transform = depth_pro.create_model_and_transforms()
+    model.to(cfg.DEVICE)
+    model.eval()
 
-def estimate_depth(model, raw_img):
+    return model, transform 
+
+
+def estimate_depth(model, image, f_px):
     with torch.no_grad():
-        return model.infer_image(raw_img)
+        prediction = model.infer(image, f_px=f_px)
+        depth = prediction["depth"].cpu().numpy()
+        focallength_px = prediction["focallength_px"].cpu().numpy()
+
+    return depth, focallength_px
+
+
+def run_object_detection(model, image, conf=0.4, imgsz=640):
+    with torch.no_grad():
+        results   = model.predict(
+            image,
+            conf=conf,
+            imgsz=imgsz,
+            )
+        boxes     = results[0].boxes.xyxy.cpu().numpy().astype(int)
+        class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
+    
+    return boxes, class_ids
 
 
 def extract_bounding_boxes_and_crops(results):
@@ -41,31 +59,49 @@ def extract_bounding_boxes_and_crops(results):
 
     return cropped_images, boxes, class_ids, class_names
 
-# Depth to PointCloud 및 부피 계산 함수
-def depth_to_pointcloud(depth_map, bbox):
-    x_min, y_min, x_max, y_max = bbox
-    fx = cfg.CAMERA_PARAMETER['fx']
-    fy = cfg.CAMERA_PARAMETER['fy']
-    cx = (x_min + x_max) / 2
-    cy = (y_min + y_max) / 2
 
-    print(cfg.CAMERA_PARAMETER)
+def load_segmentation_model(model_type="vit_b", ckpt="./checkpoints/sam_vit_b_01ec64.pth"):
+    sam = sam_model_registry[model_type](checkpoint=ckpt)
+    sam.to(device=cfg.DEVICE)
 
-    depth_region = depth_map[y_min:y_max, x_min:x_max]
+    return SamPredictor(sam)
+
+
+def get_object_mask(predictor, rgb_img, bbox):
+    with torch.no_grad():
+        x1, y1, x2, y2 = bbox
+        predictor.set_image(rgb_img)
+        input_box = np.array([x1, y1, x2, y2])
+        masks, _, _ = predictor.predict(box=input_box[None, :], multimask_output=False)
+
+    return masks[0]  # H×W, np.ndarray(bool)
+
+
+def apply_mask_to_depth(depth_map, mask):
+    masked = depth_map.copy()
+    masked[~mask] = 0.0
+
+    return masked
+
+
+def depth_to_pointcloud(depth_region, focal_length=2600.0):
+    # 워핑된 Depth의 해상도
     h, w = depth_region.shape
-    print(h, w)
 
-    u = np.linspace(x_min, x_max - 1, w)
-    v = np.linspace(y_min, y_max - 1, h)
+    # 픽셀 좌표 격자 생성
+    u = np.linspace(0, w-1, w)
+    v = np.linspace(0, h-1, h)
     uu, vv = np.meshgrid(u, v)
 
-    # 3D 좌표 계산 (벡터화된 방식)
-    x = (uu - cx) * depth_region / fx
-    y = (vv - cy) * depth_region / fy
+    # 3D 좌표 계산
     z = depth_region
+    x = (uu - w/2) * z / focal_length
+    y = (vv - h/2) * z / focal_length
 
-    points = np.stack((x, y, z), axis=-1).reshape(-1, 3)
+    points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+
     return points
+
 
 def calc_volume(points):
     pcd = o3d.geometry.PointCloud()
@@ -86,62 +122,74 @@ def calc_volume(points):
 
     return volume, dimensions
 
-# 물질 분류 및 무게 계산 함수
-def weight_estimation(cropped_images, boxes, class_ids, depth_map, result):
-    out = []
-    for i, (img, box, cls_id) in enumerate(zip(cropped_images, boxes, class_ids)):
-        points = depth_to_pointcloud(depth_map, box)
-        volume, dimensions = calc_volume(points)
 
-        cname = result.names[cls_id]
-        info  = cfg.COCO_CLASS_INFO.get(cname)
+def main(image_path, output_path, save_image=False):
+    raw_img   = cv2.imread(image_path)
+    rgb_img   = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+
+    print("Current device:", cfg.DEVICE)
+
+    print("Models Loading...")
+    de_model, transform = load_depth_estimation_model()
+    od_model = YOLO(cfg.OD_MODEL_PATH).to(cfg.DEVICE)
+    sg_model = load_segmentation_model()
+
+    stime = time()
+
+    print("Depth Estimation running...")
+    de_img, _, f_px = depth_pro.load_rgb(image_path)
+    de_img = transform(de_img).to(cfg.DEVICE)
+    depth_map, focal_length = estimate_depth(de_model, de_img, f_px)
+    depth_map *= 100    # m -> cm
+
+    print("Object Detection running...")
+    boxes, class_ids = run_object_detection(od_model, rgb_img, conf=0.4, imgsz=640)
+
+    print(f"Total processing time is {(time() - stime):.2f}s")
+
+    depth_infos = []
+    for i, (box, cls_id) in enumerate(zip(boxes, class_ids)):
+        cname = od_model.names[cls_id]
+        
+        # ▸ (1) 객체 마스크 얻기
+        mask = get_object_mask(sg_model, rgb_img, box)
+
+        # ▸ (2) 해당 박스 영역의 depth만 잘라서 마스킹
+        x1, y1, x2, y2 = box
+        rgb_crop = rgb_img[y1:y2, x1:x2]
+        depth_crop = depth_map[y1:y2, x1:x2]
+        mask_crop  = mask[y1:y2, x1:x2]
+        masked_depth = apply_mask_to_depth(depth_crop, mask_crop)
+        masked_rgb = apply_mask_to_depth(rgb_crop, mask_crop)
+
+        # ▸ (3) PointCloud 변환 & 부피 계산
+        points = depth_to_pointcloud(masked_depth, focal_length)  # bbox=None: 전체 사용
+        volume, dims = calc_volume(points)
+
+        info  = cfg.COCO_CLASS_INFO.get(cname, None)
         if info:
             avg_vol = info['width'] * info['height'] * info['depth']
             weight  = info['weight'] * (volume / avg_vol) if avg_vol > 0 else info['weight']
         else:
             weight = 0
 
-        out.append({
-            "id": i, 
-            "class": cname, 
-            "volume": volume, 
+        depth_infos.append({
+            "id": i,
+            "class": cname,
+            "volume": volume,
             "weight": weight,
-            "width": dimensions[0],
-            "height": dimensions[1], 
-            "depth": dimensions[2]
+            "width":  dims[0],
+            "height": dims[1],
+            "depth":  dims[2]
         })
-    return out
-
-# 전체 파이프라인 함수
-def process_image(image_path, output_path, save_image=False):
-    raw_img = cv2.imread(image_path)
-    rgb_img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)  # 이미지 변환 (BGR -> RGB)
-
-    print("Current device:", cfg.DEVICE)
-
-    print("Models Loading...")
-    de_model = load_depth_model(cfg.DEVICE)
-    od_model = load_yolo_model(cfg.OD_MODEL_PATH, cfg.DEVICE)
-    
-    print("Depth Estimation running...")
-    depth_map = estimate_depth(de_model, rgb_img)
-
-    print("YOLOv8 running...")
-    results = run_yolo_inference(od_model, raw_img, conf_threshold=0.7)
-    cropped_images, boxes, class_ids, class_names = extract_bounding_boxes_and_crops(results)
-
-    print("Weight Estimation running...")
-    stime = time()
-    depth_infos = weight_estimation(cropped_images, boxes, class_ids, depth_map, results[0])
-    print(f"Total processing time is {(time() - stime):.2f}s")
 
     # BBox 옆에 라벨 추가
-    for i, (box, cls_id, class_name) in enumerate(zip(boxes, class_ids, class_names)):
+    for i, (box, cls_id) in enumerate(zip(boxes, class_ids)):
         x1, y1, x2, y2 = box
         weight = depth_infos[i]['weight']
-        pushable = "Pushable" if weight < 3.5 else "Unpushable"
+        pushable = "Pushable" if weight < 5000 else "Unpushable"
         
-        label = f"{class_name}, Weight: {weight:.1f}kg, {pushable}"
+        label = f"{depth_infos[i]['class']}, Weight: {weight:.2f}g, {pushable}"
         print(label)
         
         # BBox 그리기
@@ -152,6 +200,7 @@ def process_image(image_path, output_path, save_image=False):
 
         # 라벨 추가
         cv2.putText(rgb_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (125, 255, 125), 3)
+
 
     if save_image:
         # RGB 이미지를 저장 (BGR로 변환하여 저장)
@@ -173,6 +222,6 @@ if __name__ == "__main__":
     args = parse_args()
 
     if args.image_path:
-        process_image(args.image_path, output_path=args.output_path, save_image=args.save_image)
+        main(args.image_path, output_path=args.output_path, save_image=args.save_image)
     # else:
     #     process_video(args.video_source)
