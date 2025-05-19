@@ -1,1 +1,6 @@
-python main.py --save_image --output_path glove.png --image_path glove/glove01.jpeg
+
+https://github.com/facebookresearch/segment-anything
+
+https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+
+https://huggingface.co/depth-anything/Depth-Anything-V2-Small

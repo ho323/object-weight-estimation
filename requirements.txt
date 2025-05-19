@@ -5,4 +5,10 @@ torch
 torchvision
 ultralytics
 segment-anything
-
+gradio_imageslider
+gradio==4.36.0
+matplotlib
+huggingface_hub
+pycocotools
+onnxruntime
+onnx

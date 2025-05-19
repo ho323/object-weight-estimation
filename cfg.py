@@ -3,24 +3,24 @@ import torch
 import yaml
 
 
-sensor_width = 7.6   # mm
-sensor_height = 5.7  # mm
-image_width = 4032
-image_height = 3024
-focal_length = 4.2  # mm
+# sensor_width = 7.6   # mm
+# sensor_height = 5.7  # mm
+# image_width = 4032
+# image_height = 3024
+# focal_length = 4.2  # mm
 
-fx = (focal_length / sensor_width) * image_width     # ≈ 2228
-fy = (focal_length / sensor_height) * image_height   # ≈ 2228
-cx = image_width / 2                                 # 2016
-cy = image_height / 2   
+# fx = (focal_length / sensor_width) * image_width     # ≈ 2228
+# fy = (focal_length / sensor_height) * image_height   # ≈ 2228
+# cx = image_width / 2                                 # 2016
+# cy = image_height / 2   
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CAMERA_PARAMETER = {
-    'fx': fx,
-    'fy': fy,
-    'cx': cx,
-    'cy': cy,
+    'fx': 26,
+    'fy': 26,
+    # 'cx': cx,
+    # 'cy': cy,
 }
 
 
@@ -48,11 +48,15 @@ with open('./avg_size_weight.yaml', 'r') as file:
 
 random.seed(42)
 CLASS_COLORS = [(random.random(), random.random(), random.random()) for _ in range(len(COCO_CLASSES))]
-OD_MODEL_PATH = "./checkpoints/yolov8l.pt"
+OD_MODEL_PATH = "./checkpoints/yolov8n.pt"
 
 
 # ================== 깊이 추정 모델 ================== #
 DE_MODEL_PATH = './checkpoints/depth_anything_v2_vits.pth'
+
+
+# ================== 세그멘테이션 모델 ================== #
+SAM_MODEL_PATH = "./checkpoints/sam_vit_b_01ec64.pth"
 
 
 # ================== 재료 분류 모델 ================== #
